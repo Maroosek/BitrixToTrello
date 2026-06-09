@@ -108,13 +108,19 @@ def add_card(
     list_id: str,
     name: str,
     description: str = "",
+    start: Optional[str] = None,
     due: Optional[str] = None,
+    due_complete: bool = False,
     member_id: Optional[str] = None,
 ) -> dict:
     """Creates a card (task) in the given list."""
     payload = {**_auth(), "idList": list_id, "name": name, "desc": description}
+    if start:
+        payload["start"] = start
     if due:
         payload["due"] = due
+    if due_complete:
+        payload["dueComplete"] = "true"
     if member_id:
         payload["idMembers"] = member_id
     resp = requests.post(f"{BASE_URL}/cards", params=payload)
@@ -126,27 +132,31 @@ def update_card(
     card_id: str,
     name: Optional[str] = None,
     description: Optional[str] = None,
+    start: Optional[str] = None,
     due: Optional[str] = None,
+    due_complete: Optional[bool] = None,
     list_id: Optional[str] = None,
     member_id: Optional[str] = None,
 ) -> dict:
     """Updates any fields of an existing card."""
     payload = {**_auth()}
-    if name        is not None: payload["name"]      = name
-    if description is not None: payload["desc"]      = description
-    if due         is not None: payload["due"]       = due
-    if list_id     is not None: payload["idList"]    = list_id
-    if member_id   is not None: payload["idMembers"] = member_id
+    if name         is not None: payload["name"]        = name
+    if description  is not None: payload["desc"]        = description
+    if start        is not None: payload["start"]       = start
+    if due          is not None: payload["due"]         = due
+    if due_complete is not None: payload["dueComplete"] = "true" if due_complete else "false"
+    if list_id      is not None: payload["idList"]      = list_id
+    if member_id    is not None: payload["idMembers"]   = member_id
     resp = requests.put(f"{BASE_URL}/cards/{card_id}", params=payload)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_board_cards(board_id: str) -> list[dict]:
-    """Returns all cards on a board: id, name, desc, idList."""
+    """Returns all cards on a board: id, name, desc, idList, due, dueComplete, start."""
     resp = requests.get(
         f"{BASE_URL}/boards/{board_id}/cards",
-        params={**_auth(), "fields": "id,name,desc,idList"},
+        params={**_auth(), "fields": "id,name,desc,idList,due,dueComplete,start"},
     )
     resp.raise_for_status()
     return resp.json()
@@ -286,10 +296,10 @@ def fetch_group_members(group_id: int) -> list[dict]:
     return members
 
 
-def fetch_bitrix_projects() -> list[dict]:
+def fetch_bitrix_projects(with_members: bool = True) -> list[dict]:
     """
     Fetches all Bitrix24 groups/projects with pagination (50 per page).
-    Enriches each project with a MEMBER_IDS list (Bitrix user IDs).
+    When with_members=True, enriches each project with a MEMBER_IDS list.
     Returns list of dicts: {ID, NAME, DESCRIPTION, MEMBER_IDS}.
     """
     projects = []
@@ -322,14 +332,17 @@ def fetch_bitrix_projects() -> list[dict]:
 
     print(f"✅ Total Bitrix24 projects fetched: {len(projects)}")
 
-    # Enrich each project with its member list
-    print("📥 Fetching group members...")
-    for project in projects:
-        members = fetch_group_members(int(project["ID"]))
-        project["MEMBER_IDS"] = [str(m["USER_ID"]) for m in members]
-        time.sleep(0.2)
+    if with_members:
+        print("📥 Fetching group members...")
+        for project in projects:
+            members = fetch_group_members(int(project["ID"]))
+            project["MEMBER_IDS"] = [str(m["USER_ID"]) for m in members]
+            time.sleep(0.2)
+        print("✅ Group members fetched.")
+    else:
+        for project in projects:
+            project["MEMBER_IDS"] = []
 
-    print("✅ Group members fetched.")
     return projects
 
 
@@ -415,7 +428,6 @@ def build_user_map(bitrix_users: list[dict], trello_members: list[dict]) -> dict
     """
     print("\n🔗 Matching Bitrix24 users with Trello members...")
 
-    # Build Trello lookup: normalized full name → member_id
     trello_by_name: dict[str, str] = {}
     for m in trello_members:
         key = normalize(m.get("fullName", ""))
@@ -558,43 +570,179 @@ def init_upsert_boards(
 
 
 # ─────────────────────────────────────────────
-# INIT – tasks (upsert)
+# SYNC – board members only
 # ─────────────────────────────────────────────
 
-def init_upsert_tasks(
+def sync_board_members(
+    board_map: dict[str, dict],
+    user_map: dict[str, str],
+) -> None:
+    """
+    Checks every board in board_map and adds any Bitrix group members
+    that are missing from the corresponding Trello board.
+    Does not create or modify any boards or cards.
+    """
+    print("\n" + "=" * 55)
+    print("👥 Syncing board members: Bitrix24 → Trello")
+    print("=" * 55)
+
+    added_total = 0
+    already_total = 0
+
+    for group_id, data in board_map.items():
+        board    = data["trello"]
+        board_id = board["id"]
+        project  = data["bitrix"]
+
+        member_ids = project.get("MEMBER_IDS", [])
+        if not member_ids:
+            print(f"\n  [{board['name']}] no Bitrix members to sync")
+            continue
+
+        current_board_members = {m["id"] for m in get_board_members(board_id)}
+        added = already = 0
+
+        print(f"\n  [{board['name']}] checking {len(member_ids)} Bitrix member(s)...")
+
+        for bitrix_user_id in member_ids:
+            trello_member_id = user_map.get(bitrix_user_id)
+            if not trello_member_id:
+                continue  # unmatched Bitrix user – no Trello account found
+
+            if trello_member_id in current_board_members:
+                already += 1
+            else:
+                try:
+                    add_member_to_board(board_id, trello_member_id)
+                    current_board_members.add(trello_member_id)
+                    added += 1
+                except requests.exceptions.HTTPError as e:
+                    print(f"    ⚠️  Could not add member {trello_member_id}: {e}")
+                time.sleep(0.1)
+
+        print(f"    added: {added} | already present: {already}")
+        added_total   += added
+        already_total += already
+
+    print(f"\n✅ Members sync complete — added: {added_total} | already present: {already_total}")
+
+
+# ─────────────────────────────────────────────
+# SYNC – tasks (compare → fill gaps → update)
+# ─────────────────────────────────────────────
+
+def _extract_bitrix_id_from_card(card: dict) -> Optional[str]:
+    """Extracts the Bitrix task ID stored in the first line of a card description."""
+    desc = card.get("desc", "") or ""
+    for line in desc.splitlines():
+        if line.startswith("**Bitrix ID:**"):
+            return line.replace("**Bitrix ID:**", "").strip()
+    return None
+
+
+def _collect_trello_cards(board_map: dict[str, dict]) -> dict[str, dict[str, dict]]:
+    """
+    Fetches all existing Trello cards for every board in board_map.
+
+    Returns:
+        {group_id → {bitrix_task_id → card}}
+    """
+    print("\n📥 Collecting existing Trello cards...")
+    trello_index: dict[str, dict[str, dict]] = {}
+
+    for group_id, data in board_map.items():
+        board_id = data["trello"]["id"]
+        cards    = get_board_cards(board_id)
+
+        cards_by_bitrix_id: dict[str, dict] = {}
+        for card in cards:
+            bid = _extract_bitrix_id_from_card(card)
+            if bid:
+                cards_by_bitrix_id[bid] = card
+
+        trello_index[group_id] = cards_by_bitrix_id
+        print(f"  [{data['trello']['name']}] {len(cards_by_bitrix_id)} card(s) indexed")
+        time.sleep(0.05)
+
+    total_cards = sum(len(v) for v in trello_index.values())
+    print(f"✅ Trello cards collected: {total_cards} total across {len(board_map)} board(s)")
+    return trello_index
+
+
+def _collect_bitrix_tasks(board_map: dict[str, dict]) -> dict[str, list[dict]]:
+    """
+    Fetches all Bitrix24 tasks for every group in board_map.
+    Tasks with GROUP_ID=0 (no group) are skipped entirely.
+
+    Returns:
+        {group_id → [task, ...]}
+    """
+    print("\n📥 Collecting Bitrix24 tasks...")
+    bitrix_index: dict[str, list[dict]] = {}
+
+    for group_id in board_map:
+        if group_id == "0":
+            print(f"  ⏭️  Skipping GROUP_ID=0 (ungrouped tasks ignored)")
+            continue
+        tasks = fetch_bitrix_tasks(int(group_id))
+        bitrix_index[group_id] = tasks
+
+    total_tasks = sum(len(v) for v in bitrix_index.values())
+    print(f"✅ Bitrix24 tasks collected: {total_tasks} total across {len(bitrix_index)} group(s)")
+    return bitrix_index
+
+
+def sync_tasks(
     board_map: dict[str, dict],
     bitrix_users: list[dict],
     user_map: dict[str, str],
-) -> int:
+    sync_members: bool = False,
+) -> None:
     """
-    For each project, fetches Bitrix24 tasks and upserts them as Trello cards.
-    Matches existing cards by 'Bitrix ID' in description; updates if changed, creates if new.
+    Syncs Bitrix24 tasks → Trello cards for all projects in board_map.
 
-    Returns total number of cards created or updated.
+    Steps:
+      1. Fetch all existing Trello cards (indexed by Bitrix ID) for every board.
+      2. Fetch all Bitrix24 tasks for every group (GROUP_ID=0 skipped).
+      3. For each task:
+           - Missing in Trello        → create card + optionally add responsible to board.
+           - Exists but changed       → update card + optionally add responsible to board.
+           - Unchanged                → skip.
+
+    Args:
+        sync_members: When True, also ensures the responsible member is added
+                      to the board whenever a card is created or updated.
     """
-    total = 0
+    print("\n" + "=" * 55)
+    print("🔄 Syncing tasks: Bitrix24 → Trello")
+    print("=" * 55)
 
-    for group_id, data in board_map.items():
+    # Step 1 – snapshot of what is already in Trello
+    trello_index = _collect_trello_cards(board_map)
+
+    # Step 2 – fetch fresh tasks from Bitrix24
+    bitrix_index = _collect_bitrix_tasks(board_map)
+
+    # Step 3 – compare and act
+    created_total = 0
+    updated_total = 0
+    skipped_total = 0
+
+    for group_id, tasks in bitrix_index.items():
+        data     = board_map[group_id]
         lists    = data["lists"]
         board    = data["trello"]
         board_id = board["id"]
-        print(f"\n📌 Project: '{board['name']}' (GROUP_ID={group_id})")
 
-        tasks = fetch_bitrix_tasks(int(group_id))
-        if not tasks:
-            print("  ℹ️  No tasks.")
-            continue
+        print(f"\n📌 [{board['name']}] — {len(tasks)} task(s) from Bitrix24")
 
-        # Build lookup of existing cards by Bitrix ID extracted from description
-        existing_cards     = get_board_cards(board_id)
-        cards_by_bitrix_id: dict[str, dict] = {}
-        for card in existing_cards:
-            desc = card.get("desc", "") or ""
-            for line in desc.splitlines():
-                if line.startswith("**Bitrix ID:**"):
-                    bid = line.replace("**Bitrix ID:**", "").strip()
-                    cards_by_bitrix_id[bid] = card
-                    break
+        existing_cards = trello_index.get(group_id, {})
+        created = updated = skipped = 0
+
+        # Cache current board members to avoid repeated API calls
+        board_member_ids: set[str] = (
+            {m["id"] for m in get_board_members(board_id)} if sync_members else set()
+        )
 
         for task in tasks:
             bitrix_task_id = str(task.get("id", ""))
@@ -602,45 +750,78 @@ def init_upsert_tasks(
             list_id        = lists.get(status_id, lists["1"])
             title          = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
             description    = build_card_description(task, bitrix_users)
+            start          = task.get("dateStart") or None
             due            = task.get("closedDate") or None
-            trello_member  = user_map.get(str(task.get("responsibleId", "")))
+            due_complete   = status_id == "5"
+            responsible_id = str(task.get("responsibleId", ""))
+            trello_member  = user_map.get(responsible_id)
 
-            existing = cards_by_bitrix_id.get(bitrix_task_id)
+            existing = existing_cards.get(bitrix_task_id)
 
-            if existing:
-                changed = (
-                    existing.get("name")   != title       or
-                    existing.get("desc")   != description or
-                    existing.get("idList") != list_id
+            if existing is None:
+                # ── Card is missing in Trello → create it ──────────────────
+                add_card(
+                    list_id=list_id,
+                    name=title,
+                    description=description,
+                    start=start,
+                    due=due,
+                    due_complete=due_complete,
+                    member_id=trello_member,
                 )
+                print(f"    ✅ Created: [{STATUS_MAP.get(status_id, '?')}] {title}")
+                created += 1
+
+            else:
+                # ── Card exists → check for changes ────────────────────────
+                changed = (
+                    existing.get("name")        != title        or
+                    existing.get("desc")        != description  or
+                    existing.get("idList")      != list_id      or
+                    existing.get("due")         != due          or
+                    existing.get("start")       != start        or
+                    bool(existing.get("dueComplete")) != due_complete
+                )
+
                 if changed:
                     update_card(
                         card_id=existing["id"],
                         name=title,
                         description=description,
+                        start=start,
                         due=due,
+                        due_complete=due_complete,
                         list_id=list_id,
                         member_id=trello_member,
                     )
                     print(f"    ✏️  Updated: [{STATUS_MAP.get(status_id, '?')}] {title}")
-                    total += 1
+                    updated += 1
                 else:
-                    print(f"    ✔️  No changes: {title}")
-            else:
-                add_card(
-                    list_id=list_id,
-                    name=title,
-                    description=description,
-                    due=due,
-                    member_id=trello_member,
-                )
-                print(f"    ✅ Created: [{STATUS_MAP.get(status_id, '?')}] {title}")
-                total += 1
+                    skipped += 1
+                    continue  # nothing changed, skip member check too
+
+            # ── Optionally ensure responsible is on the board ──────────────
+            if sync_members and trello_member and trello_member not in board_member_ids:
+                try:
+                    add_member_to_board(board_id, trello_member)
+                    board_member_ids.add(trello_member)
+                except requests.exceptions.HTTPError as e:
+                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
 
             time.sleep(0.1)
 
-    print(f"\n✅ Total cards created/updated: {total}")
-    return total
+        print(
+            f"  📊 [{board['name']}] created: {created} | "
+            f"updated: {updated} | unchanged: {skipped}"
+        )
+        created_total += created
+        updated_total += updated
+        skipped_total += skipped
+
+    print(
+        f"\n✅ Tasks sync complete — "
+        f"created: {created_total} | updated: {updated_total} | unchanged: {skipped_total}"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -694,19 +875,230 @@ def compare_boards_with_bitrix(board_map: dict[str, dict]) -> None:
 
 
 # ─────────────────────────────────────────────
-# ENTRY POINT
+# ENTRY POINTS
 # ─────────────────────────────────────────────
 
-def init_sync(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
+def full_sync(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
     """
-    Full initialisation / sync flow:
-      1. Fetch Bitrix24 users and Trello workspace members; build user map.
-      2. Fetch Bitrix24 projects (with member lists); upsert Trello boards and add members.
-      3. Fetch tasks per project; upsert Trello cards (create or update).
+    Full sync flow:
+      1. Fetch users (Bitrix + Trello), build user map.
+      2. Fetch projects WITH member lists; upsert boards, columns and board members.
+      3. Sync tasks (create / update cards) + add responsible members to boards.
       4. Compare boards for discrepancies.
     """
     print("=" * 55)
-    print("🚀 Starting Bitrix24 → Trello sync")
+    print("🚀 FULL SYNC — Bitrix24 → Trello")
+    print("=" * 55)
+
+    bitrix_users   = fetch_bitrix_users()
+    trello_members = get_workspace_members(workspace_id)
+    user_map       = build_user_map(bitrix_users, trello_members)
+
+    projects  = fetch_bitrix_projects(with_members=True)
+    board_map = init_upsert_boards(projects, user_map=user_map, workspace_id=workspace_id)
+
+    sync_tasks(board_map, bitrix_users, user_map, sync_members=True)
+
+    compare_boards_with_bitrix(board_map)
+
+    print("=" * 55)
+    print("✅ Full sync complete.")
+    print("=" * 55)
+
+
+def tasks_and_members_sync(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
+    """
+    Lightweight sync — no board/column creation:
+      1. Fetch users (Bitrix + Trello), build user map.
+      2. Fetch projects WITHOUT fetching group members (faster).
+         Boards must already exist in Trello.
+      3. Sync tasks (create / update cards) + add responsible members to boards.
+      4. Sync board members from Bitrix group membership.
+    """
+    print("=" * 55)
+    print("🔄 TASKS + MEMBERS SYNC — Bitrix24 → Trello")
+    print("=" * 55)
+
+    bitrix_users   = fetch_bitrix_users()
+    trello_members = get_workspace_members(workspace_id)
+    user_map       = build_user_map(bitrix_users, trello_members)
+
+    # Fetch projects without member lists first (faster) — boards must already exist
+    projects = fetch_bitrix_projects(with_members=False)
+
+    existing_boards = get_trello_boards()
+    boards_by_name  = {b["name"].strip().lower(): b for b in existing_boards}
+
+    board_map: dict[str, dict] = {}
+    skipped_projects: list[str] = []
+
+    # Now fetch group members and sync board membership
+    print("\n📥 Fetching group members for member sync...")
+    for group_id, data in board_map.items():
+        members = fetch_group_members(int(group_id))
+        data["bitrix"]["MEMBER_IDS"] = [str(m["USER_ID"]) for m in members]
+        time.sleep(0.2)
+
+    sync_board_members(board_map, user_map)
+
+    for project in projects:
+        group_id = str(project["ID"])
+        name     = project.get("NAME", f"Project #{group_id}").strip()
+        board    = boards_by_name.get(name.lower())
+
+        if not board:
+            skipped_projects.append(name)
+            continue
+
+        board_id       = board["id"]
+        existing_lists = get_board_lists(board_id)
+        lists_by_name  = {l["name"].strip().lower(): l["id"] for l in existing_lists}
+        lists: dict[str, str] = {}
+
+        for status_id in STATUS_ORDER:
+            col_name = STATUS_MAP[status_id]
+            lists[status_id] = lists_by_name.get(col_name.lower(), list(lists_by_name.values())[0])
+
+        board_map[group_id] = {
+            "bitrix": project,
+            "trello": board,
+            "lists":  lists,
+        }
+
+    if skipped_projects:
+        print(f"\n  ⚠️  Boards not found in Trello (skipped): {len(skipped_projects)}")
+        for name in skipped_projects:
+            print(f"    - {name}")
+
+    # Sync tasks (also adds responsible users to boards)
+    sync_tasks(board_map, bitrix_users, user_map, sync_members=True)
+
+
+    print("=" * 55)
+    print("✅ Tasks + members sync complete.")
+    print("=" * 55)
+
+def _today_iso() -> str:
+    """Returns today's date as an ISO 8601 string with UTC+1 offset, e.g. 2026-06-09T00:00:00+01:00."""
+    from datetime import date, timezone, timedelta
+    tz_plus1 = timezone(timedelta(hours=1))
+    today    = date.today()
+    return f"{today.isoformat()}T00:00:00+01:00"
+
+
+def fetch_today_tasks() -> list[dict]:
+    """
+    Fetches all Bitrix24 tasks that had any activity today (across all groups),
+    using the ACTIVITY_DATE >= today filter.
+    Skips tasks with GROUP_ID = 0 (ungrouped).
+
+    Returns list of tasks enriched with their group_id as a string.
+    """
+    tasks  = []
+    start  = 0
+    since  = _today_iso()
+    print(f"  📥 Fetching tasks with ACTIVITY_DATE >= {since}...")
+
+    while True:
+        result = bitrix_call("tasks.task.list.json", {
+            "filter": {
+                ">=ACTIVITY_DATE": since,
+            },
+            "select": [
+                "ID", "TITLE", "DESCRIPTION", "STATUS",
+                "CREATED_DATE", "CLOSED_DATE", "DATE_START",
+                "CREATED_BY", "RESPONSIBLE_ID", "GROUP_ID",
+            ],
+            "start": start,
+        })
+
+        if "error" in result:
+            print(f"  ❌ Bitrix error: {result['error']}")
+            break
+
+        batch = result.get("result", {}).get("tasks", [])
+        if not batch:
+            break
+
+        # Drop ungrouped tasks immediately
+        grouped = [t for t in batch if str(t.get("groupId", t.get("GROUP_ID", "0"))) != "0"]
+        tasks.extend(grouped)
+
+        total      = result.get("total", 0)
+        next_start = result.get("next")
+        print(f"    Fetched {len(tasks)} grouped tasks (total in Bitrix: {total})...")
+
+        if next_start is None:
+            break
+
+        start = next_start
+        time.sleep(0.3)
+
+    print(f"  ✅ Today's tasks fetched: {len(tasks)}")
+    return tasks
+
+
+def _build_board_map_from_trello(
+    projects: list[dict],
+    workspace_id: str,
+) -> dict[str, dict]:
+    """
+    Builds a board_map by matching Bitrix projects to existing Trello boards by name.
+    Does NOT create any boards. Projects without a matching board are skipped.
+
+    Returns:
+        {bitrix_group_id -> {"bitrix": project, "trello": board, "lists": {status_id: list_id}}}
+    """
+    existing_boards = get_trello_boards()
+    boards_by_name  = {b["name"].strip().lower(): b for b in existing_boards}
+
+    board_map: dict[str, dict] = {}
+    skipped: list[str] = []
+
+    for project in projects:
+        group_id = str(project["ID"])
+        name     = project.get("NAME", f"Project #{group_id}").strip()
+        board    = boards_by_name.get(name.lower())
+
+        if not board:
+            skipped.append(f"{name} (GROUP_ID={group_id})")
+            continue
+
+        board_id       = board["id"]
+        existing_lists = get_board_lists(board_id)
+        lists_by_name  = {l["name"].strip().lower(): l["id"] for l in existing_lists}
+        lists: dict[str, str] = {}
+
+        for status_id in STATUS_ORDER:
+            col_name = STATUS_MAP[status_id]
+            lists[status_id] = lists_by_name.get(col_name.lower(), list(lists_by_name.values())[0])
+
+        board_map[group_id] = {
+            "bitrix": project,
+            "trello": board,
+            "lists":  lists,
+        }
+        time.sleep(0.05)
+
+    if skipped:
+        print(f"  ⚠️  No matching Trello board for {len(skipped)} project(s):")
+        for s in skipped:
+            print(f"    - {s}")
+
+    return board_map
+
+
+def refresh_today_tasks(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
+    """
+    Fast refresh of tasks that changed today:
+      1. Fetch Bitrix24 users + Trello workspace members; build user map.
+      2. Fetch today's changed tasks from Bitrix24 (ACTIVITY_DATE >= today).
+      3. Determine which groups (projects) are affected.
+      4. Fetch Bitrix24 project list; match affected groups to Trello boards by name.
+      5. For each affected board pull existing cards and upsert only the changed tasks.
+    """
+    print("=" * 55)
+    print(f"⚡ REFRESH TODAY'S TASKS — {_today_iso()[:10]}")
     print("=" * 55)
 
     # 1. Users
@@ -714,20 +1106,146 @@ def init_sync(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
     trello_members = get_workspace_members(workspace_id)
     user_map       = build_user_map(bitrix_users, trello_members)
 
-    # 2. Projects → boards (members fetched inside fetch_bitrix_projects)
-    projects  = fetch_bitrix_projects()
-    board_map = init_upsert_boards(projects, user_map=user_map, workspace_id=workspace_id)
+    # 2. Today's changed tasks
+    today_tasks = fetch_today_tasks()
+    if not today_tasks:
+        print("ℹ️  No tasks changed today. Nothing to do.")
+        return
 
-    # 3. Tasks → cards
-    init_upsert_tasks(board_map, bitrix_users, user_map)
+    # 3. Group tasks by GROUP_ID
+    # Bitrix returns groupId (camelCase) in task list responses
+    tasks_by_group: dict[str, list[dict]] = {}
+    for task in today_tasks:
+        gid = str(task.get("groupId", task.get("GROUP_ID", "0")))
+        tasks_by_group.setdefault(gid, []).append(task)
 
-    # 4. Comparison report
-    compare_boards_with_bitrix(board_map)
+    affected_group_ids = set(tasks_by_group.keys())
+    print(f"\n📋 Affected groups today: {sorted(affected_group_ids)}")
 
+    # 4. Fetch all Bitrix projects, keep only affected ones, match to Trello boards
+    all_projects      = fetch_bitrix_projects(with_members=False)
+    affected_projects = [p for p in all_projects if str(p["ID"]) in affected_group_ids]
+
+    print(f"\n🔎 Matched {len(affected_projects)}/{len(affected_group_ids)} affected groups to Bitrix projects")
+
+    board_map = _build_board_map_from_trello(affected_projects, workspace_id)
+
+    if not board_map:
+        print("⚠️  None of the affected groups have a matching Trello board.")
+        return
+
+    # 5. Upsert today's tasks board by board
+    print("\n" + "=" * 55)
+    print("🔄 Upserting today's changed tasks")
     print("=" * 55)
-    print("✅ Sync complete.")
-    print("=" * 55)
 
+    created_total = updated_total = skipped_total = 0
+
+    for group_id, data in board_map.items():
+        tasks    = tasks_by_group.get(group_id, [])
+        lists    = data["lists"]
+        board    = data["trello"]
+        board_id = board["id"]
+
+        if not tasks:
+            continue
+
+        print(f"\n📌 [{board['name']}] — {len(tasks)} task(s) changed today")
+
+        # Fetch existing cards for this board only
+        existing_cards_raw = get_board_cards(board_id)
+        cards_by_bitrix_id: dict[str, dict] = {}
+        for card in existing_cards_raw:
+            bid = _extract_bitrix_id_from_card(card)
+            if bid:
+                cards_by_bitrix_id[bid] = card
+
+        board_member_ids: set[str] = {m["id"] for m in get_board_members(board_id)}
+        created = updated = skipped = 0
+
+        for task in tasks:
+            bitrix_task_id = str(task.get("id", ""))
+            status_id      = str(task.get("status", "1"))
+            list_id        = lists.get(status_id, lists["1"])
+            title          = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
+            description    = build_card_description(task, bitrix_users)
+            start          = task.get("dateStart") or None
+            due            = task.get("closedDate") or None
+            due_complete   = status_id == "5"
+            trello_member  = user_map.get(str(task.get("responsibleId", "")))
+
+            existing = cards_by_bitrix_id.get(bitrix_task_id)
+
+            if existing is None:
+                add_card(
+                    list_id=list_id,
+                    name=title,
+                    description=description,
+                    start=start,
+                    due=due,
+                    due_complete=due_complete,
+                    member_id=trello_member,
+                )
+                print(f"    ✅ Created: [{STATUS_MAP.get(status_id, '?')}] {title}")
+                created += 1
+
+            else:
+                changed = (
+                    existing.get("name")              != title        or
+                    existing.get("desc")              != description  or
+                    existing.get("idList")            != list_id      or
+                    existing.get("due")               != due          or
+                    existing.get("start")             != start        or
+                    bool(existing.get("dueComplete")) != due_complete
+                )
+
+                if changed:
+                    update_card(
+                        card_id=existing["id"],
+                        name=title,
+                        description=description,
+                        start=start,
+                        due=due,
+                        due_complete=due_complete,
+                        list_id=list_id,
+                        member_id=trello_member,
+                    )
+                    print(f"    ✏️  Updated: [{STATUS_MAP.get(status_id, '?')}] {title}")
+                    updated += 1
+                else:
+                    skipped += 1
+
+            # Ensure responsible is on the board
+            if trello_member and trello_member not in board_member_ids:
+                try:
+                    add_member_to_board(board_id, trello_member)
+                    board_member_ids.add(trello_member)
+                except requests.exceptions.HTTPError as e:
+                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
+
+            time.sleep(0.1)
+
+        print(
+            f"  📊 [{board['name']}] created: {created} | "
+            f"updated: {updated} | unchanged: {skipped}"
+        )
+        created_total += created
+        updated_total += updated
+        skipped_total += skipped
+
+    print(
+        f"\n✅ Today's refresh complete — "
+        f"created: {created_total} | updated: {updated_total} | unchanged: {skipped_total}"
+    )
+    print("=" * 55)
 
 if __name__ == "__main__":
-    init_sync()
+    # Choose one:
+    # full_sync()
+    # tasks_and_members_sync()
+    refresh_today_tasks()
+
+# ─────────────────────────────────────────────
+# REFRESH – today's changed tasks only
+# ─────────────────────────────────────────────
+
