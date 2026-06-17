@@ -216,7 +216,7 @@ def upsert_single_task(task: dict, workspace_id: str = WORKSPACE_ID) -> dict:
                 start=start,
                 due=due,
                 due_complete=due_complete,
-                list_id=list_id,
+                list_id=list_id if existing.get("idList") != list_id else None,
                 member_id=trello_member,
             )
             action = "updated"

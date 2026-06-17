@@ -57,10 +57,9 @@ def update_board(board_id: str, name: Optional[str] = None, description: Optiona
 
 
 def get_trello_boards() -> list[dict]:
-    """Returns all boards on the account: id, name, desc, idOrganization, shortUrl."""
     resp = requests.get(
         f"{BASE_URL}/members/me/boards",
-        params={**_auth(), "fields": "id,name,desc,idOrganization,shortUrl"},
+        params={**_auth(), "fields": "id,name,desc,idOrganization,shortUrl,closed"},
     )
     resp.raise_for_status()
     return resp.json()
@@ -144,10 +143,21 @@ def update_card(
     if description  is not None: payload["desc"]        = description
     if start        is not None: payload["start"]       = start
     if due          is not None: payload["due"]         = due
-    if due_complete is not None: payload["dueComplete"] = "true" if due_complete else "false"
     if list_id      is not None: payload["idList"]      = list_id
     if member_id    is not None: payload["idMembers"]   = member_id
+
+    # ⚠️ Only send dueComplete when there's a due date to attach it to
+    if due_complete is not None and (due is not None or due_complete is False):
+        payload["dueComplete"] = "true" if due_complete else "false"
+    elif due_complete and due is not None:
+        payload["dueComplete"] = "true"
+
     resp = requests.put(f"{BASE_URL}/cards/{card_id}", params=payload)
+    if not resp.ok:
+        import logging
+        logging.getLogger(__name__).error(
+            "Trello update_card %s failed: %s — %s", card_id, resp.status_code, resp.text
+        )
     resp.raise_for_status()
     return resp.json()
 
@@ -511,7 +521,11 @@ def init_upsert_boards(
     """
     print("\n📋 Upserting boards in Trello...")
     existing_boards = get_trello_boards()
-    boards_by_name  = {b["name"].strip().lower(): b for b in existing_boards}
+    boards_by_name = {
+        b["name"].strip().lower(): b
+        for b in existing_boards
+        if not b.get("closed", False)  # ← skip archived boards
+    }
 
     board_map: dict[str, dict] = {}
 
@@ -926,7 +940,11 @@ def tasks_and_members_sync(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
     # 2. Build board_map — match Bitrix projects to existing Trello boards by name
     projects = fetch_bitrix_projects(with_members=False)
     existing_boards = get_trello_boards()
-    boards_by_name = {b["name"].strip().lower(): b for b in existing_boards}
+    boards_by_name = {
+        b["name"].strip().lower(): b
+        for b in existing_boards
+        if not b.get("closed", False)  # ← add this
+    }
 
     print(f"\n🔎 Matching {len(projects)} Bitrix projects against {len(existing_boards)} Trello boards...")
 
@@ -1053,7 +1071,11 @@ def _build_board_map_from_trello(
         {bitrix_group_id -> {"bitrix": project, "trello": board, "lists": {status_id: list_id}}}
     """
     existing_boards = get_trello_boards()
-    boards_by_name  = {b["name"].strip().lower(): b for b in existing_boards}
+    boards_by_name = {
+        b["name"].strip().lower(): b
+        for b in existing_boards
+        if not b.get("closed", False)  # ← add this
+    }
 
     board_map: dict[str, dict] = {}
     skipped: list[str] = []
