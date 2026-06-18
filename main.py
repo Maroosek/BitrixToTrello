@@ -182,11 +182,21 @@ def upsert_single_task(task: dict, workspace_id: str = WORKSPACE_ID) -> dict:
     )
 
     board_member_ids: set[str] = {m["id"] for m in get_board_members(board_id)}
-    action  = "unchanged"
+    action = "unchanged"
     card_id = existing["id"] if existing else None
 
+    # first add member
+    if trello_member and trello_member not in board_member_ids:
+        try:
+            add_member_to_board(board_id, trello_member)
+            board_member_ids.add(trello_member)
+        except requests.exceptions.HTTPError as e:
+            logger.warning("Could not add member %s to board: %s", trello_member, e)
+            trello_member = None
+
+    # secondly, create or update card
     if existing is None:
-        card    = add_card(
+        card = add_card(
             list_id=list_id,
             name=title,
             description=description,
@@ -196,17 +206,17 @@ def upsert_single_task(task: dict, workspace_id: str = WORKSPACE_ID) -> dict:
             member_id=trello_member,
         )
         card_id = card["id"]
-        action  = "created"
+        action = "created"
         logger.info("Created card for task %s on board '%s'", bitrix_task_id, board["name"])
 
     else:
         changed = (
-            existing.get("name")              != title        or
-            existing.get("desc")              != description  or
-            existing.get("idList")            != list_id      or
-            existing.get("due")               != due          or
-            existing.get("start")             != start        or
-            bool(existing.get("dueComplete")) != due_complete
+                existing.get("name") != title or
+                existing.get("desc") != description or
+                existing.get("idList") != list_id or
+                existing.get("due") != due or
+                existing.get("start") != start or
+                bool(existing.get("dueComplete")) != due_complete
         )
         if changed:
             update_card(
@@ -225,11 +235,11 @@ def upsert_single_task(task: dict, workspace_id: str = WORKSPACE_ID) -> dict:
             logger.info("Card for task %s unchanged, skipping", bitrix_task_id)
 
     # 5. Ensure responsible is a board member
-    if trello_member and trello_member not in board_member_ids:
-        try:
-            add_member_to_board(board_id, trello_member)
-        except requests.exceptions.HTTPError as e:
-            logger.warning("Could not add member %s to board: %s", trello_member, e)
+    # if trello_member and trello_member not in board_member_ids:
+    #     try:
+    #         add_member_to_board(board_id, trello_member)
+    #     except requests.exceptions.HTTPError as e:
+    #         logger.warning("Could not add member %s to board: %s", trello_member, e)
 
     return {
         "action":   action,

@@ -2,6 +2,10 @@ import requests
 import config
 import time
 from typing import Optional
+import logging
+logger = logging.getLogger(__name__)
+
+#TODO fix the way it almost always updates tasks that are not updated and should be ignored
 
 TRELLO_API_KEY = config.ConfigTrello.TRELLO_API_KEY
 TRELLO_TOKEN = config.ConfigTrello.TRELLO_TOKEN
@@ -98,6 +102,26 @@ def add_member_to_board(board_id: str, member_id: str, role: str = "normal") -> 
     print(f"  ✅ Member {member_id} added to board {board_id} as '{role}'")
     return resp.json()
 
+def _trello_request(method: str, url: str, params: dict, retries: int = 5) -> requests.Response:
+    """
+    Executes a Trello API request with automatic retry on 429 Rate Limit.
+    Respects the Retry-After header if present, otherwise backs off exponentially.
+    """
+    for attempt in range(1, retries + 1):
+        resp = requests.request(method, url, params=params)
+        if resp.status_code == 429:
+            # Trello sometimes sends Retry-After in seconds
+            retry_after = int(resp.headers.get("Retry-After", 0))
+            wait = retry_after if retry_after > 0 else min(2 ** attempt, 30)
+            logger.warning(
+                "Trello rate limit hit (%s), waiting %ss before retry %s/%s",
+                url.split("/")[-1], wait, attempt, retries
+            )
+            time.sleep(wait)
+            continue
+        return resp
+    return resp
+
 
 # ─────────────────────────────────────────────
 # TRELLO – cards (tasks)
@@ -122,7 +146,7 @@ def add_card(
         payload["dueComplete"] = "true"
     if member_id:
         payload["idMembers"] = member_id
-    resp = requests.post(f"{BASE_URL}/cards", params=payload)
+    resp = _trello_request("POST", f"{BASE_URL}/cards", params=payload)
     resp.raise_for_status()
     return resp.json()
 
@@ -152,12 +176,9 @@ def update_card(
     elif due_complete and due is not None:
         payload["dueComplete"] = "true"
 
-    resp = requests.put(f"{BASE_URL}/cards/{card_id}", params=payload)
+    resp = _trello_request("PUT", f"{BASE_URL}/cards/{card_id}", params=payload)
     if not resp.ok:
-        import logging
-        logging.getLogger(__name__).error(
-            "Trello update_card %s failed: %s — %s", card_id, resp.status_code, resp.text
-        )
+        logger.error("Trello update_card %s failed: %s — %s", card_id, resp.status_code, resp.text)
     resp.raise_for_status()
     return resp.json()
 
@@ -760,20 +781,29 @@ def sync_tasks(
 
         for task in tasks:
             bitrix_task_id = str(task.get("id", ""))
-            status_id      = str(task.get("status", "1"))
-            list_id        = lists.get(status_id, lists["1"])
-            title          = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
-            description    = build_card_description(task, bitrix_users)
-            start          = task.get("dateStart") or None
-            due            = task.get("closedDate") or None
-            due_complete   = status_id == "5"
+            status_id = str(task.get("status", "1"))
+            list_id = lists.get(status_id, lists["1"])
+            title = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
+            description = build_card_description(task, bitrix_users)
+            start = task.get("dateStart") or None
+            due = task.get("closedDate") or None
+            due_complete = status_id == "5"
             responsible_id = str(task.get("responsibleId", ""))
-            trello_member  = user_map.get(responsible_id)
+            trello_member = user_map.get(responsible_id)
 
             existing = existing_cards.get(bitrix_task_id)
 
+            # ── 1. Najpierw upewnij się, że member jest na tablicy ─────────────
+            if sync_members and trello_member and trello_member not in board_member_ids:
+                try:
+                    add_member_to_board(board_id, trello_member)
+                    board_member_ids.add(trello_member)
+                except requests.exceptions.HTTPError as e:
+                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
+                    trello_member = None  # nie przypisuj do karty
+
+            # ── 2. Dopiero teraz utwórz/aktualizuj kartę ───────────────────────
             if existing is None:
-                # ── Card is missing in Trello → create it ──────────────────
                 add_card(
                     list_id=list_id,
                     name=title,
@@ -787,14 +817,13 @@ def sync_tasks(
                 created += 1
 
             else:
-                # ── Card exists → check for changes ────────────────────────
                 changed = (
-                    existing.get("name")        != title        or
-                    existing.get("desc")        != description  or
-                    existing.get("idList")      != list_id      or
-                    existing.get("due")         != due          or
-                    existing.get("start")       != start        or
-                    bool(existing.get("dueComplete")) != due_complete
+                        existing.get("name") != title or
+                        existing.get("desc") != description or
+                        existing.get("idList") != list_id or
+                        existing.get("due") != due or
+                        existing.get("start") != start or
+                        bool(existing.get("dueComplete")) != due_complete
                 )
 
                 if changed:
@@ -812,15 +841,7 @@ def sync_tasks(
                     updated += 1
                 else:
                     skipped += 1
-                    continue  # nothing changed, skip member check too
-
-            # ── Optionally ensure responsible is on the board ──────────────
-            if sync_members and trello_member and trello_member not in board_member_ids:
-                try:
-                    add_member_to_board(board_id, trello_member)
-                    board_member_ids.add(trello_member)
-                except requests.exceptions.HTTPError as e:
-                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
+                    continue  # nic się nie zmieniło, pomijamy
 
             time.sleep(0.1)
 
@@ -1190,17 +1211,27 @@ def refresh_today_tasks(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
 
         for task in tasks:
             bitrix_task_id = str(task.get("id", ""))
-            status_id      = str(task.get("status", "1"))
-            list_id        = lists.get(status_id, lists["1"])
-            title          = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
-            description    = build_card_description(task, bitrix_users)
-            start          = task.get("dateStart") or None
-            due            = task.get("closedDate") or None
-            due_complete   = status_id == "5"
-            trello_member  = user_map.get(str(task.get("responsibleId", "")))
+            status_id = str(task.get("status", "1"))
+            list_id = lists.get(status_id, lists["1"])
+            title = (task.get("title", "") or "").strip() or f"Task #{bitrix_task_id}"
+            description = build_card_description(task, bitrix_users)
+            start = task.get("dateStart") or None
+            due = task.get("closedDate") or None
+            due_complete = status_id == "5"
+            trello_member = user_map.get(str(task.get("responsibleId", "")))
 
             existing = cards_by_bitrix_id.get(bitrix_task_id)
 
+            # ── 1. Najpierw dodaj member do tablicy ────────────────────────────
+            if trello_member and trello_member not in board_member_ids:
+                try:
+                    add_member_to_board(board_id, trello_member)
+                    board_member_ids.add(trello_member)
+                except requests.exceptions.HTTPError as e:
+                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
+                    trello_member = None
+
+            # ── 2. Utwórz lub zaktualizuj kartę ───────────────────────────────
             if existing is None:
                 add_card(
                     list_id=list_id,
@@ -1216,12 +1247,12 @@ def refresh_today_tasks(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
 
             else:
                 changed = (
-                    existing.get("name")              != title        or
-                    existing.get("desc")              != description  or
-                    existing.get("idList")            != list_id      or
-                    existing.get("due")               != due          or
-                    existing.get("start")             != start        or
-                    bool(existing.get("dueComplete")) != due_complete
+                        existing.get("name") != title or
+                        existing.get("desc") != description or
+                        existing.get("idList") != list_id or
+                        existing.get("due") != due or
+                        existing.get("start") != start or
+                        bool(existing.get("dueComplete")) != due_complete
                 )
 
                 if changed:
@@ -1239,14 +1270,6 @@ def refresh_today_tasks(workspace_id: Optional[str] = WORKSPACE_ID) -> None:
                     updated += 1
                 else:
                     skipped += 1
-
-            # Ensure responsible is on the board
-            if trello_member and trello_member not in board_member_ids:
-                try:
-                    add_member_to_board(board_id, trello_member)
-                    board_member_ids.add(trello_member)
-                except requests.exceptions.HTTPError as e:
-                    print(f"      ⚠️  Could not add member {trello_member} to board: {e}")
 
             time.sleep(0.1)
 
